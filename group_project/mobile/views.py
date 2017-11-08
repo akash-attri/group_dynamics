@@ -1,5 +1,5 @@
-import json
-from datetime import datetime
+from datetime import datetime, time, date
+import networkx as nx
 from django.contrib.auth import authenticate
 from django.contrib.auth.models import User
 from django.contrib.gis.geos import Point, Polygon
@@ -13,8 +13,8 @@ from rest_framework.serializers import ModelSerializer
 from rest_framework.status import HTTP_200_OK, HTTP_400_BAD_REQUEST
 from rest_framework.views import APIView
 
-from .models import UserProfile, LocationDensity, GroupLocalization
-from .constants import GEOFENCE_BOUNDS, UNKNOWN_GEOFENCE
+from .models import UserProfile, LocationDensity, GroupLocalization, DailyMatrix, Groups
+from .constants import GEOFENCE_BOUNDS, UNKNOWN_GEOFENCE, GEOFENCE_NAMES
 
 
 class UserListSerializer(ModelSerializer):
@@ -97,16 +97,15 @@ class UserLoginAPIView(APIView):
         return Response(serializer.errors, status=HTTP_400_BAD_REQUEST)
 
 
-# class LocationDensitySerializer(ModelSerializer):
-#     class Meta:
-#         model = LocationDensity
-#         fields = '__all__'
-#
-#
-# class GroupLocalizationSerializer(ModelSerializer):
-#     class Meta:
-#         model = GroupLocalization
-#         fields = '__all__'
+class LocationDensitySerializer(ModelSerializer):
+    geofence = serializers.SerializerMethodField('geofencename')
+
+    def geofencename(self, obj):
+        return GEOFENCE_NAMES[obj.location]
+
+    class Meta:
+        model = LocationDensity
+        fields = '__all__'
 
 
 @api_view(['POST'])
@@ -114,8 +113,8 @@ class UserLoginAPIView(APIView):
 def assign_groups(request):
     json = request.data
     if request.method == 'POST':
-        username = json.keys()[0]
-        data = json.values()[0]
+        username = list(json.keys())[0]
+        data = list(json.values())[0]
         for entry in data:
             user = User.objects.get(username=username)
             time = entry['time'].split(':')[0] + ':' + entry['time'].split(':')[1]
@@ -150,15 +149,133 @@ def assign_geofence(lat, long):
     return UNKNOWN_GEOFENCE
 
 
+@api_view(['GET'])
+@permission_classes((permissions.AllowAny,))
+def density_api(request):
+    location_density = LocationDensity.objects.filter(
+        timestamp__range=(datetime.combine(date(2017, 11, 6), time.min),
+                          datetime.combine(datetime.now().date(), time.max))
+    )
+    serializer = LocationDensitySerializer(location_density, many=True)
+    loc_density = {}
+    data = []
+    for loc_obj in serializer.data:
+        loc_density[loc_obj['geofence']] = loc_density.get(loc_obj['geofence'], 0) + loc_obj['density']
+    for locn in list(loc_density.keys()):
+        data.append({
+            'name': locn,
+            'strength': loc_density[locn]
+        })
+    return Response({'data': data}, status=HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes((permissions.AllowAny,))
+def strength_api(request, uid):
+    user = UserProfile.objects.get(user_id=uid)
+    group = identify_group(user)
+    data = []
+    for friend in list(group.keys()):
+        data.append({
+            'username': friend,
+            'strength': group[friend]
+        })
+    return Response({'data': data}, status=HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes((permissions.AllowAny,))
+def gender_api(request):
+    data = [
+        {'name': 'girls', 'value': Groups.objects.filter(dynamic='Girls').count()},
+        {'name': 'boys', 'value': Groups.objects.filter(dynamic='Boys').count()},
+        {'name': 'mixed', 'value': Groups.objects.filter(dynamic='Both').count()}
+    ]
+    return Response({'data': data}, status=HTTP_200_OK)
+
+
+@api_view(['GET'])
+@permission_classes((permissions.AllowAny,))
+def groups_api(request, uid):
+    data = []
+    for group in Groups.objects.all():
+        members = []
+        user_strength = 0
+        grp = eval(group.members)
+        if int(uid) in grp:
+            for frnd in grp:
+                matrix = eval(DailyMatrix.objects.first().group)
+                try:
+                    strength = matrix[User.objects.get(id=uid).username][User.objects.get(id=frnd).username]
+                except:
+                    try:
+                        strength = matrix[User.objects.get(id=frnd).username][User.objects.get(id=uid).username]
+                    except:
+                        strength = 0
+                members.append({
+                    'name': User.objects.get(id=frnd).username,
+                    'strength': strength
+                })
+                user_strength += strength
+            data.append({
+                'group_id': group.id,
+                'group_strength': user_strength,
+                'members': members
+            })
+    return Response({'data': data}, status=HTTP_200_OK)
+
+
 def data_analysis():
     timestamp_set = {}
     users = UserProfile.objects.all()
-    for obj in users:
-        identify_group(obj, timestamp_set)
+    for usr in users:
+        timestamp_set[usr.user.username] = identify_group(usr)
+    DailyMatrix.objects.all().delete()
+    DailyMatrix.objects.create(date=datetime.now().date(), group=str(timestamp_set))
 
 
-def identify_group(user, timestamp_set):
+def identify_group(user):
+    dict = {}
     group_objects = GroupLocalization.objects.filter(user=user).order_by('timestamp')
     for group_obj in group_objects:
-        group_dict = json.loads(group_obj.group)
-        timestamp_set[user.user.username] = group_dict
+        group_dict = eval(group_obj.group)
+        for friend in list(group_dict.keys()):
+            grp_strength = dict.get(friend, 0) + group_dict[friend]
+            dict[friend] = grp_strength
+    return dict
+
+
+def make_graph():
+    user_node = {}
+    for usr in UserProfile.objects.all():
+        user_node[usr.user.username] = usr.user.id
+    graph = nx.Graph()
+    matrix_obj = DailyMatrix.objects.first()
+    matrix = eval(matrix_obj.group)
+    for usr in list(matrix.keys()):
+        for friend in list(matrix[usr].keys()):
+            if not user_node.get(usr) or not user_node.get(friend):
+                continue
+            graph.add_edge(user_node[usr], user_node[friend], weight=matrix[usr][friend])
+
+    threshold_graph(graph, 'Weak', 10, 30)
+    threshold_graph(graph, 'Neutral', 31, 50)
+    threshold_graph(graph, 'Strong', 51)
+
+
+def threshold_graph(graph, gp_type, min_wt, max_wt=1000):
+    grp_graph = nx.Graph([(u, v, d) for (u, v, d) in graph.edges(data=True) if min_wt <= d['weight'] <= max_wt])
+    groups_list = list(nx.find_cliques(grp_graph))
+    for grp in groups_list:
+        group = Groups.objects.create(members=str(grp), type=gp_type)
+        ml = fml = False
+        for uid in grp:
+            ml = True if UserProfile.objects.get(user_id=uid).gender in ['male', 'Male'] else ml
+            fml = True if UserProfile.objects.get(user_id=uid).gender in ['female', 'Female'] else fml
+        if ml and fml:
+            group.dynamic = 'Both'
+        elif ml:
+            group.dynamic = 'Boys'
+        else:
+            group.dynamic = 'Girls'
+        group.save()

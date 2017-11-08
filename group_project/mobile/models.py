@@ -27,3 +27,9 @@ class GroupLocalization(models.Model):
 class DailyMatrix(models.Model):
     date = models.DateField(blank=False)
     group = models.TextField()
+
+
+class Groups(models.Model):
+    members = models.CharField(max_length=200)
+    dynamic = models.CharField(max_length=6)
+    type = models.CharField(max_length=7)
